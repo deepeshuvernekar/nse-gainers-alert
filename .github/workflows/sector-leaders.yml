@@ -18,11 +18,11 @@
       "steps": [
         {
           "name": "Checkout repo",
-          "uses": "actions/checkout@v4"
+          "uses": "actions/checkout@v5"
         },
         {
           "name": "Set up Python",
-          "uses": "actions/setup-python@v5",
+          "uses": "actions/setup-python@v6",
           "with": {
             "python-version": "3.11"
           }
@@ -35,8 +35,8 @@
           "name": "Run sector scan",
           "run": "python sector_leaders.py",
           "env": {
-            "TELEGRAM_BOT_TOKEN": "${{ secrets.SECTOR_BOT_TOKEN }}",
-            "TELEGRAM_CHAT_ID": "${{ secrets.SECTOR_CHAT_ID }}",
+            "TELEGRAM_BOT_TOKEN": "${{ secrets.TELEGRAM_BOT_TOKEN }}",
+            "TELEGRAM_CHAT_ID": "${{ secrets.TELEGRAM_CHAT_ID }}",
             "TOP_SECTORS": "4",
             "TOP_STOCKS": "5",
             "MIN_GROUP": "4",
@@ -44,8 +44,7 @@
             "MIN_3M_GAIN": "25",
             "TOP_MOMENTUM": "10",
             "SHOW_LAGGARDS": "1",
-            "SKIP_IF_CLOSED": "1",
-            "INDEX_STRIP": "0"
+            "SKIP_IF_CLOSED": "1"
           }
         }
       ]
