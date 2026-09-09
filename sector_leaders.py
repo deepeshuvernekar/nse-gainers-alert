@@ -50,7 +50,7 @@ MIN_VOLUME = int(os.environ.get("MIN_VOLUME", "100000"))
 MIN_3M_GAIN = float(os.environ.get("MIN_3M_GAIN", "25"))
 TOP_MOMENTUM = int(os.environ.get("TOP_MOMENTUM", "10"))
 SHOW_LAGGARDS = os.environ.get("SHOW_LAGGARDS", "1") == "1"
-SKIP_IF_CLOSED = os.environ.get("SKIP_IF_CLOSED", "1") == "1"
+SKIP_IF_CLOSED = os.environ.get("SKIP_IF_CLOSED", "0") == "1"
 
 # Index constituent lists. Mid + small only -- no large caps.
 CSV_FILES = [
