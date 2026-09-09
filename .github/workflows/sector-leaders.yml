@@ -44,7 +44,7 @@
             "MIN_3M_GAIN": "25",
             "TOP_MOMENTUM": "10",
             "SHOW_LAGGARDS": "1",
-            "SKIP_IF_CLOSED": "1"
+            "SKIP_IF_CLOSED": "0"
           }
         }
       ]
