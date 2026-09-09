@@ -3,16 +3,17 @@
 NSE Mid/Small Sector Leaders -> Telegram
 
 Large caps are excluded entirely. The universe is NIFTY MIDCAP 150 +
-NIFTY SMALLCAP 250, filtered for liquidity.
+NIFTY SMALLCAP 250.
 
-Sector strength is computed FROM that universe -- stocks are grouped by
-their NSE industry label and the group's median move ranks the sectors.
-So "IT is leading" here means mid/small IT is leading, not TCS and Infosys.
+Data sources:
+  * Universe + sector labels: NSE's published index constituent CSVs.
+    (The old /api/equity-stockIndices JSON endpoint now returns 404 for
+    every index, including NIFTY 50, so it is no longer used.)
+  * Prices, volume and 3-month returns: Yahoo Finance, split/bonus adjusted.
 
-Part 1: ranked mid/small sector strength, with the top movers inside each
-        leading sector, annotated with their 3-month gain.
-Part 2: the strongest 3-month gainers across the whole mid/small universe,
-        with the ones in today's leading sectors listed first.
+Sector strength is computed FROM this universe -- stocks are grouped by
+their NSE industry label and each group's median move ranks the sectors.
+So "Healthcare is leading" means mid/small healthcare, not Sun Pharma.
 
 Env vars required:
     TELEGRAM_BOT_TOKEN
@@ -21,30 +22,24 @@ Env vars required:
 Optional env vars:
     TOP_SECTORS      (default 4)      leading sectors to expand
     TOP_STOCKS       (default 5)      stocks shown per sector
-    MIN_GROUP        (default 4)      min liquid stocks for a sector to rank
-    MIN_VOLUME       (default 100000) min shares traded today
-    MIN_3M_GAIN      (default 25)     min 3-month % gain to be a "momentum" name
+    MIN_GROUP        (default 4)      min stocks for a sector to rank
+    MIN_VOLUME       (default 100000) min shares traded on the latest bar
+    MIN_3M_GAIN      (default 25)     min 3-month % gain for the momentum list
     TOP_MOMENTUM     (default 10)     how many momentum names to list
     SHOW_LAGGARDS    (default 1)      also list the weakest sectors
     SKIP_IF_CLOSED   (default 1)      exit quietly when the market is closed
-    INDEX_STRIP      (default 0)      one context line of official sector indices
 """
 
 import os
 import sys
+import csv
 import time
 import html
 import statistics
 import datetime as dt
 from collections import defaultdict
-from urllib.parse import quote
 
 import requests
-
-NSE_BASE = "https://www.nseindia.com"
-ALL_INDICES = f"{NSE_BASE}/api/allIndices"
-STOCK_INDICES = f"{NSE_BASE}/api/equity-stockIndices?index="
-MARKET_STATUS = f"{NSE_BASE}/api/marketStatus"
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 
@@ -56,20 +51,27 @@ MIN_3M_GAIN = float(os.environ.get("MIN_3M_GAIN", "25"))
 TOP_MOMENTUM = int(os.environ.get("TOP_MOMENTUM", "10"))
 SHOW_LAGGARDS = os.environ.get("SHOW_LAGGARDS", "1") == "1"
 SKIP_IF_CLOSED = os.environ.get("SKIP_IF_CLOSED", "1") == "1"
-INDEX_STRIP = os.environ.get("INDEX_STRIP", "0") == "1"
 
-# The only universe this script looks at. No large caps.
-UNIVERSE_INDICES = ["NIFTY MIDCAP 150", "NIFTY SMALLCAP 250"]
+# Index constituent lists. Mid + small only -- no large caps.
+CSV_FILES = [
+    "ind_niftymidcap150list.csv",
+    "ind_niftysmallcap250list.csv",
+]
+CSV_HOSTS = [
+    "https://nsearchives.nseindia.com/content/indices/",
+    "https://archives.nseindia.com/content/indices/",
+]
+
+MARKET_STATUS = "https://www.nseindia.com/api/marketStatus"
 
 BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json, text/plain, */*",
+    "Accept": "text/csv,application/json,text/plain,*/*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": f"{NSE_BASE}/market-data/live-market-indices",
-    "Connection": "keep-alive",
+    "Referer": "https://www.nseindia.com/",
 }
 
 
@@ -77,98 +79,79 @@ def log(msg):
     print(f"[{dt.datetime.now(IST):%H:%M:%S}] {msg}", flush=True)
 
 
-def make_session():
-    """NSE requires cookies from a real page visit before the API will answer."""
-    s = requests.Session()
-    s.headers.update(BROWSER_HEADERS)
-    for url in (NSE_BASE, f"{NSE_BASE}/market-data/live-market-indices"):
-        try:
-            s.get(url, timeout=15)
-            time.sleep(1)
-        except requests.RequestException as e:
-            log(f"warm-up request to {url} failed: {e}")
-    return s
-
-
-def get_json(session, url, attempts=4):
-    delay = 2
-    for i in range(1, attempts + 1):
-        try:
-            r = session.get(url, timeout=20)
-            if r.status_code == 200 and r.text.strip().startswith(("{", "[")):
-                return r.json()
-            log(f"attempt {i}: HTTP {r.status_code} for {url[:70]}")
-        except requests.RequestException as e:
-            log(f"attempt {i}: {e}")
-        time.sleep(delay)
-        delay *= 2
-        if i == 2:
-            try:
-                session.get(NSE_BASE, timeout=15)
-                time.sleep(1)
-            except requests.RequestException:
-                pass
-    return None
-
-
-def market_is_open(session):
-    data = get_json(session, MARKET_STATUS)
-    if not data:
-        return True
-    for row in data.get("marketState", []):
-        if row.get("market") == "Capital Market":
-            status = (row.get("marketStatus") or "").lower()
-            log(f"capital market status: {status}")
-            return "close" not in status
+def market_is_open():
+    """Best-effort holiday guard. Never blocks the run if it can't tell."""
+    try:
+        s = requests.Session()
+        s.headers.update(BROWSER_HEADERS)
+        s.get("https://www.nseindia.com", timeout=15)
+        time.sleep(1)
+        r = s.get(MARKET_STATUS, timeout=20)
+        if r.status_code != 200:
+            log(f"market status check returned HTTP {r.status_code} -- proceeding")
+            return True
+        for row in r.json().get("marketState", []):
+            if row.get("market") == "Capital Market":
+                status = (row.get("marketStatus") or "").lower()
+                log(f"capital market status: {status}")
+                return "close" not in status
+    except Exception as e:
+        log(f"market status check failed ({e}) -- proceeding")
     return True
 
 
-def fetch_constituents(session, index_name):
-    data = get_json(session, STOCK_INDICES + quote(index_name))
-    if not data:
-        return []
-    rows = []
-    for row in data.get("data", []):
-        sym = (row.get("symbol") or "").strip()
-        if not sym or sym.upper() == index_name.upper():
+def fetch_csv(filename):
+    """Download one index constituent CSV, trying both archive hosts."""
+    for host in CSV_HOSTS:
+        url = host + filename
+        for attempt in (1, 2):
+            try:
+                r = requests.get(url, headers=BROWSER_HEADERS, timeout=30)
+                if r.status_code == 200 and "Symbol" in r.text[:400]:
+                    return r.text
+                log(f"{filename} via {host.split('/')[2]}: HTTP {r.status_code}")
+            except requests.RequestException as e:
+                log(f"{filename} via {host.split('/')[2]}: {e}")
+            time.sleep(2)
+    return None
+
+
+def parse_constituents(text):
+    """CSV columns: Company Name, Industry, Symbol, Series, ISIN Code."""
+    rows = {}
+    for row in csv.DictReader(text.splitlines()):
+        sym = (row.get("Symbol") or "").strip()
+        industry = (row.get("Industry") or "").strip()
+        if not sym or not industry:
             continue
-        try:
-            pct = float(row.get("pChange"))
-            price = float(row.get("lastPrice"))
-        except (TypeError, ValueError):
-            continue
-        try:
-            vol = int(float(row.get("totalTradedVolume") or 0))
-        except (TypeError, ValueError):
-            vol = 0
-        industry = ((row.get("meta") or {}).get("industry") or "").strip()
-        rows.append({
-            "symbol": sym, "pct": pct, "price": price,
-            "volume": vol, "industry": industry,
-        })
+        rows[sym] = {
+            "symbol": sym,
+            "industry": industry,
+            "name": (row.get("Company Name") or "").strip(),
+        }
     return rows
 
 
-def build_universe(session):
+def build_universe():
     universe = {}
-    for idx in UNIVERSE_INDICES:
-        rows = fetch_constituents(session, idx)
-        log(f"{idx}: {len(rows)} constituents")
-        for r in rows:
-            universe[r["symbol"]] = r
-        time.sleep(1)
-    liquid = [r for r in universe.values()
-              if r["volume"] >= MIN_VOLUME and r["industry"]]
-    log(f"universe {len(universe)}, liquid with industry tag {len(liquid)}")
-    return liquid
+    for filename in CSV_FILES:
+        text = fetch_csv(filename)
+        if not text:
+            log(f"could not download {filename}")
+            continue
+        rows = parse_constituents(text)
+        log(f"{filename}: {len(rows)} constituents")
+        universe.update(rows)
+    log(f"mid/small universe: {len(universe)} stocks")
+    return universe
 
 
-def three_month_returns(symbols):
-    """Batch-fetch split/bonus-adjusted 3-month returns. Returns {symbol: pct}."""
+def fetch_prices(symbols):
+    """Latest close, day move, volume and 3M return per symbol, from Yahoo."""
     try:
         import yfinance as yf
     except ImportError:
-        log("yfinance not installed -- 3-month data unavailable")
+        log("ERROR: yfinance not installed")
         return {}
 
     out = {}
@@ -186,33 +169,42 @@ def three_month_returns(symbols):
             continue
         if df is None or df.empty:
             continue
+
         try:
-            close = df["Close"]
+            close, volume = df["Close"], df["Volume"]
         except (KeyError, TypeError):
             continue
-        if hasattr(close, "columns"):
-            cols = list(close.columns)
-        else:
-            cols = chunk[:1]
-            close = close.to_frame(cols[0])
-        for col in cols:
-            s = close[col].dropna()
-            if len(s) < 40:  # need a real 3 months of history
+        if not hasattr(close, "columns"):
+            close = close.to_frame(chunk[0])
+            volume = volume.to_frame(chunk[0])
+
+        for col in close.columns:
+            c = close[col].dropna()
+            if len(c) < 40:  # need a real 3 months of history
                 continue
-            first, last = float(s.iloc[0]), float(s.iloc[-1])
-            if first <= 0:
+            first, last, prev = float(c.iloc[0]), float(c.iloc[-1]), float(c.iloc[-2])
+            if first <= 0 or prev <= 0:
                 continue
-            out[str(col).replace(".NS", "")] = (last / first - 1) * 100
-        log(f"3M returns resolved: {len(out)}")
+            try:
+                vol = int(volume[col].dropna().iloc[-1])
+            except Exception:
+                vol = 0
+            out[str(col).replace(".NS", "")] = {
+                "price": last,
+                "pct": (last / prev - 1) * 100,
+                "gain3m": (last / first - 1) * 100,
+                "volume": vol,
+            }
+        log(f"prices resolved: {len(out)}")
         time.sleep(1)
     return out
 
 
-def rank_sectors(liquid):
-    """Group the mid/small universe by industry and rank by median move."""
+def rank_sectors(stocks):
+    """Group by industry label and rank each group by its median move."""
     groups = defaultdict(list)
-    for r in liquid:
-        groups[r["industry"]].append(r)
+    for s in stocks:
+        groups[s["industry"]].append(s)
 
     ranked = []
     for industry, rows in groups.items():
@@ -231,37 +223,14 @@ def rank_sectors(liquid):
     return ranked
 
 
-def fetch_index_strip(session):
-    data = get_json(session, ALL_INDICES)
-    if not data:
-        return ""
-    rows = []
-    for row in data.get("data", []):
-        if (row.get("key") or "").upper() != "SECTORAL INDICES":
-            continue
-        try:
-            rows.append((row.get("index", "").replace("NIFTY ", ""),
-                         float(row.get("percentChange"))))
-        except (TypeError, ValueError):
-            continue
-    rows.sort(key=lambda x: x[1], reverse=True)
-    return "  |  ".join(f"{n} {p:+.1f}%" for n, p in rows[:3])
-
-
 def arrow(pct):
     return "\U0001F7E2" if pct > 0 else ("\U0001F534" if pct < 0 else "\u26AA")
 
 
-def fmt_3m(gain):
-    if gain is None:
-        return "3M n/a"
-    return f"3M {gain:+.0f}%"
-
-
-def build_message(ranked, returns, momentum, liquid, strip):
+def build_message(ranked, momentum, stocks):
     now = dt.datetime.now(IST)
-    green = sum(1 for r in liquid if r["pct"] > 0)
-    total = len(liquid)
+    green = sum(1 for s in stocks if s["pct"] > 0)
+    total = len(stocks)
     pct_green = (green / total * 100) if total else 0
     breadth = "broad" if pct_green >= 60 else ("narrow" if pct_green <= 35 else "mixed")
 
@@ -271,21 +240,16 @@ def build_message(ranked, returns, momentum, liquid, strip):
         "",
     ]
 
-    if strip:
-        lines.append(f"<i>Large-cap context: {html.escape(strip)}</i>")
-        lines.append("")
-
     for sec in ranked[:TOP_SECTORS]:
         lines.append(
             f"{arrow(sec['median'])} <b>{html.escape(sec['industry'])}</b>  "
             f"{sec['median']:+.2f}%  <i>({sec['up']}/{sec['count']} up)</i>"
         )
         for st in sec["stocks"][:TOP_STOCKS]:
-            gain = returns.get(st["symbol"])
-            star = "*" if gain is not None and gain >= MIN_3M_GAIN else " "
+            star = "*" if st["gain3m"] >= MIN_3M_GAIN else " "
             lines.append(
                 f"  {star} {html.escape(st['symbol'])}  {st['pct']:+.2f}%  "
-                f"| {fmt_3m(gain)}  | {st['price']:,.1f}"
+                f"| 3M {st['gain3m']:+.0f}%  | {st['price']:,.1f}"
             )
         lines.append("")
 
@@ -307,7 +271,7 @@ def build_message(ranked, returns, momentum, liquid, strip):
             )
             lines.append(f"     <i>{html.escape(m['industry'][:38])}</i>")
     else:
-        lines.append(f"<i>No mid/small names cleared the {MIN_3M_GAIN:.0f}% 3M filter.</i>")
+        lines.append(f"<i>No names cleared the {MIN_3M_GAIN:.0f}% 3M filter.</i>")
 
     return "\n".join(lines)
 
@@ -349,44 +313,51 @@ def send_telegram(text):
 
 
 def main():
-    session = make_session()
-
-    if SKIP_IF_CLOSED and not market_is_open(session):
+    if SKIP_IF_CLOSED and not market_is_open():
         log("market closed -- exiting without sending")
         return 0
 
-    liquid = build_universe(session)
-    if not liquid:
-        log("no mid/small data returned")
-        send_telegram(
-            "<b>Mid/Small Sector Leaders</b>\nCould not fetch constituent data "
-            "from NSE on this run. Check the Actions log."
-        )
+    universe = build_universe()
+    if not universe:
+        send_telegram("<b>Mid/Small Sector Leaders</b>\nCould not download the "
+                      "NSE constituent lists on this run. Check the Actions log.")
         return 1
 
-    ranked = rank_sectors(liquid)
+    prices = fetch_prices(list(universe.keys()))
+    if not prices:
+        send_telegram("<b>Mid/Small Sector Leaders</b>\nCould not fetch price "
+                      "data on this run. Check the Actions log.")
+        return 1
+
+    stocks = []
+    for sym, meta in universe.items():
+        p = prices.get(sym)
+        if not p or p["volume"] < MIN_VOLUME:
+            continue
+        stocks.append({**meta, **p})
+    log(f"liquid stocks with prices: {len(stocks)}")
+
+    if not stocks:
+        send_telegram("<b>Mid/Small Sector Leaders</b>\nNo stocks passed the "
+                      "volume filter. Try lowering MIN_VOLUME.")
+        return 1
+
+    ranked = rank_sectors(stocks)
     if not ranked:
-        log("no sector groups met the minimum size")
         send_telegram("<b>Mid/Small Sector Leaders</b>\nNo sector had enough "
-                      "liquid names to rank. Try lowering MIN_GROUP or MIN_VOLUME.")
+                      "liquid names to rank. Try lowering MIN_GROUP.")
         return 1
-
-    returns = three_month_returns([r["symbol"] for r in liquid])
 
     leading = {s["industry"] for s in ranked[:TOP_SECTORS]}
-    momentum = []
-    for r in liquid:
-        gain = returns.get(r["symbol"])
-        if gain is None or gain < MIN_3M_GAIN:
-            continue
-        momentum.append({**r, "gain3m": gain, "hot": r["industry"] in leading})
+    momentum = [
+        {**s, "hot": s["industry"] in leading}
+        for s in stocks if s["gain3m"] >= MIN_3M_GAIN
+    ]
     momentum.sort(key=lambda x: (x["hot"], x["gain3m"]), reverse=True)
     momentum = momentum[:TOP_MOMENTUM]
     log(f"momentum picks: {len(momentum)}")
 
-    strip = fetch_index_strip(session) if INDEX_STRIP else ""
-
-    send_telegram(build_message(ranked, returns, momentum, liquid, strip))
+    send_telegram(build_message(ranked, momentum, stocks))
     return 0
 
 
