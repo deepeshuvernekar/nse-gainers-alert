@@ -227,65 +227,94 @@ def arrow(pct):
     return "\U0001F7E2" if pct > 0 else ("\U0001F534" if pct < 0 else "\u26AA")
 
 
-def build_message(ranked, momentum, stocks):
+def table(headers, rows, aligns):
+    """Fixed-width monospace table for Telegram <pre> blocks."""
+    cols = list(zip(*([headers] + rows))) if rows else [[h] for h in headers]
+    widths = [max(len(str(c)) for c in col) for col in cols]
+    out = []
+    for r in [headers] + rows:
+        cells = []
+        for val, w, a in zip(r, widths, aligns):
+            cells.append(str(val).rjust(w) if a == "r" else str(val).ljust(w))
+        out.append(" ".join(cells).rstrip())
+    return "\n".join(out)
+
+
+def build_sections(ranked, momentum, stocks):
+    """Returns a list of self-contained HTML blocks."""
     now = dt.datetime.now(IST)
     green = sum(1 for s in stocks if s["pct"] > 0)
     total = len(stocks)
     pct_green = (green / total * 100) if total else 0
     breadth = "broad" if pct_green >= 60 else ("narrow" if pct_green <= 35 else "mixed")
 
-    lines = [
-        f"<b>Mid/Small Sector Leaders</b>  {now:%d %b, %H:%M} IST",
-        f"<i>{green}/{total} stocks green ({pct_green:.0f}%) - {breadth} tape</i>",
-        "",
+    sections = [
+        f"<b>Mid/Small Sector Leaders</b>  {now:%d %b, %H:%M} IST\n"
+        f"<i>{green}/{total} green ({pct_green:.0f}%) - {breadth} tape</i>"
     ]
 
-    for sec in ranked[:TOP_SECTORS]:
-        lines.append(
-            f"{arrow(sec['median'])} <b>{html.escape(sec['industry'])}</b>  "
-            f"{sec['median']:+.2f}%  <i>({sec['up']}/{sec['count']} up)</i>"
-        )
-        for st in sec["stocks"][:TOP_STOCKS]:
-            star = "*" if st["gain3m"] >= MIN_3M_GAIN else " "
-            lines.append(
-                f"  {star} {html.escape(st['symbol'])}  {st['pct']:+.2f}%  "
-                f"| 3M {st['gain3m']:+.0f}%  | {st['price']:,.1f}"
-            )
-        lines.append("")
+    # Sector summary table
+    rows = [[s["industry"][:18], f"{s['median']:+.2f}", f"{s['up']}/{s['count']}"]
+            for s in ranked[:TOP_SECTORS]]
+    sections.append(
+        "<b>Leading sectors</b>\n<pre>"
+        + html.escape(table(["SECTOR", "MED%", "UP"], rows, ["l", "r", "r"]))
+        + "</pre>"
+    )
 
-    if SHOW_LAGGARDS and len(ranked) >= 3:
-        tail = "  |  ".join(
-            f"{s['industry']} {s['median']:+.2f}%" for s in ranked[-3:][::-1]
+    # One table of top stocks per leading sector
+    for sec in ranked[:TOP_SECTORS]:
+        rows = []
+        for st in sec["stocks"][:TOP_STOCKS]:
+            flag = "*" if st["gain3m"] >= MIN_3M_GAIN else ""
+            rows.append([f"{flag}{st['symbol']}", f"{st['pct']:+.2f}",
+                         f"{st['gain3m']:+.0f}", f"{st['price']:,.0f}"])
+        sections.append(
+            f"<b>{html.escape(sec['industry'])}</b>  {sec['median']:+.2f}%\n<pre>"
+            + html.escape(table(["STOCK", "DAY%", "3M%", "LTP"], rows,
+                                ["l", "r", "r", "r"]))
+            + "</pre>"
         )
-        lines.append(f"<b>Weakest:</b> {html.escape(tail)}")
-        lines.append("")
+
+    tail_pool = ranked[TOP_SECTORS:]
+    if SHOW_LAGGARDS and len(tail_pool) >= 2:
+        rows = [[s["industry"][:18], f"{s['median']:+.2f}", f"{s['up']}/{s['count']}"]
+                for s in tail_pool[-3:][::-1]]
+        sections.append(
+            "<b>Weakest sectors</b>\n<pre>"
+            + html.escape(table(["SECTOR", "MED%", "UP"], rows, ["l", "r", "r"]))
+            + "</pre>"
+        )
 
     if momentum:
-        lines.append(f"<b>Strongest 3M gainers (&gt;{MIN_3M_GAIN:.0f}%)</b>")
-        lines.append("<i>* = in a leading sector today</i>")
-        for m in momentum:
-            star = "*" if m["hot"] else "-"
-            lines.append(
-                f"{star} <b>{html.escape(m['symbol'])}</b>  "
-                f"3M {m['gain3m']:+.0f}%  | today {m['pct']:+.2f}%"
-            )
-            lines.append(f"     <i>{html.escape(m['industry'][:38])}</i>")
+        rows = [[f"{'*' if m['hot'] else ''}{m['symbol']}",
+                 f"{m['gain3m']:+.0f}", f"{m['pct']:+.2f}"] for m in momentum]
+        sections.append(
+            f"<b>Strongest 3M gainers (&gt;{MIN_3M_GAIN:.0f}%)</b>\n<pre>"
+            + html.escape(table(["STOCK", "3M%", "DAY%"], rows, ["l", "r", "r"]))
+            + "</pre>\n<i>* = in a leading sector today</i>"
+        )
     else:
-        lines.append(f"<i>No names cleared the {MIN_3M_GAIN:.0f}% 3M filter.</i>")
+        sections.append(f"<i>No names cleared the {MIN_3M_GAIN:.0f}% 3M filter.</i>")
 
-    return "\n".join(lines)
+    return sections
 
 
-def send_telegram(text):
+def send_telegram(sections):
+    """Sends HTML blocks, packing them into as few messages as fit."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         log("ERROR: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set")
         return False
 
+    if isinstance(sections, str):
+        sections = [sections]
+
+    # Never split inside a <pre> block -- pack whole sections only
     chunks, current = [], ""
-    for block in text.split("\n\n"):
-        if len(current) + len(block) + 2 > 3800:
+    for block in sections:
+        if current and len(current) + len(block) + 2 > 3800:
             chunks.append(current)
             current = block
         else:
@@ -357,7 +386,7 @@ def main():
     momentum = momentum[:TOP_MOMENTUM]
     log(f"momentum picks: {len(momentum)}")
 
-    send_telegram(build_message(ranked, momentum, stocks))
+    send_telegram(build_sections(ranked, momentum, stocks))
     return 0
 
 
